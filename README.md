@@ -1,6 +1,31 @@
-# Cloudflare Worker 部署指南
+# Amazon Q to Claude API Bridge
 
-## 准备工作
+[![Version](https://img.shields.io/badge/version-2.1.0-blue.svg)](https://github.com/yourusername/amazonq_worker)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+将 Amazon Q API 转换为 Anthropic Claude API 和 OpenAI API 格式的 Cloudflare Worker 桥接服务。
+
+## ✨ 特性
+
+- ✅ **工具调用优化**：自动处理 Amazon Q 的 10k description 限制
+- ✅ **Token 计数**：估算并返回 input/output tokens，支持 Claude Code 上下文管理
+- ✅ **系统提示词**：正确处理 Claude API 的 system 消息
+- ✅ **消息配对**：自动确保 user/assistant 消息成对（Amazon Q 要求）
+- ✅ **Ping 事件**：支持 Claude Code 的连接保活和 UI 动画
+- ✅ **流式响应**：完整的 SSE 事件支持
+- ✅ **双格式支持**：同时支持 Anthropic 和 OpenAI API 格式
+- ✅ **自动 Token 刷新**：后台自动刷新过期的 access token
+
+## 📚 文档
+
+- [部署指南](DEPLOYMENT_GUIDE.md) - 详细的部署步骤
+- [优化说明](OPTIMIZATIONS.md) - 技术细节和优化内容
+
+---
+
+## 快速开始
+
+### 准备工作
 
 确保你有：
 - Cloudflare 账号（免费版即可）
@@ -82,12 +107,14 @@ curl https://你的worker地址.workers.dev/
 # 响应示例：
 {
   "message": "Amazon Q to OpenAI API Bridge",
-  "version": "2.0.0",
-  "endpoints": {
-    "openai_chat": "/v1/chat/completions",
-    "anthropic_messages": "/v1/messages",
-    ...
-  }
+  "version": "2.1.0",
+  "features": [
+    "Tool calling with 10k description limit",
+    "Input tokens estimation",
+    "System prompt handling",
+    "Message pairing for Amazon Q",
+    "Ping events for Claude Code"
+  ]
 }
 ```
 

@@ -1,5 +1,4 @@
 const AMAZONQ_ENDPOINT = 'https://codewhisperer.us-east-1.amazonaws.com';
-
 const SSO_OIDC_ENDPOINT = 'https://oidc.us-east-1.amazonaws.com';
 
 const STREAMING_USER_AGENT_HINTS = [
@@ -27,13 +26,16 @@ const DEFAULT_CONFIG = {
     bufferMaxSize: 10240,
     tokenRefreshMarginSeconds: 300,
   },
+  limits: {
+    maxToolDescriptionLength: 10000,
+    toolDescriptionTruncateSuffix: '...[truncated]',
+  },
   ssl: {
     verifyOidc: true,
   },
 };
 
 const DEFAULT_ANTHROPIC_VERSION = '2023-06-01';
-
 const upperLogLevels = ['DEBUG', 'INFO', 'WARN', 'ERROR'];
 
 class Logger {
@@ -98,6 +100,81 @@ class Logger {
 }
 
 const logger = new Logger(DEFAULT_CONFIG.logging);
+
+const estimateTokens = (text) => {
+  if (!text) return 0;
+  const charCount = text.length;
+  return Math.ceil(charCount / 4);
+};
+
+const estimateMessagesTokens = (messages) => {
+  if (!Array.isArray(messages)) return 0;
+  let total = 0;
+  for (const msg of messages) {
+    if (msg.content) {
+      if (typeof msg.content === 'string') {
+        total += estimateTokens(msg.content);
+      } else if (Array.isArray(msg.content)) {
+        for (const item of msg.content) {
+          if (item.type === 'text' && item.text) {
+            total += estimateTokens(item.text);
+          } else if (item.type === 'tool_use' && item.input) {
+            total += estimateTokens(JSON.stringify(item.input));
+          } else if (item.type === 'tool_result' && item.content) {
+            total += estimateTokens(JSON.stringify(item.content));
+          }
+        }
+      }
+    }
+    total += 4;
+  }
+  return total;
+};
+
+const truncateToolDescription = (description, maxLength, suffix) => {
+  if (!description || description.length <= maxLength) {
+    return description;
+  }
+  const truncateLen = maxLength - suffix.length;
+  return description.slice(0, truncateLen) + suffix;
+};
+
+const processTools = (tools, config) => {
+  if (!Array.isArray(tools)) return tools;
+  
+  const maxLen = config.limits?.maxToolDescriptionLength || 10000;
+  const suffix = config.limits?.toolDescriptionTruncateSuffix || '...[truncated]';
+  
+  let truncatedCount = 0;
+  const processed = tools.map(tool => {
+    if (!tool.input_schema?.description && !tool.description) {
+      return tool;
+    }
+    
+    const toolCopy = { ...tool };
+    
+    if (toolCopy.description && toolCopy.description.length > maxLen) {
+      toolCopy.description = truncateToolDescription(toolCopy.description, maxLen, suffix);
+      truncatedCount++;
+    }
+    
+    if (toolCopy.input_schema?.description && toolCopy.input_schema.description.length > maxLen) {
+      toolCopy.input_schema = {
+        ...toolCopy.input_schema,
+        description: truncateToolDescription(toolCopy.input_schema.description, maxLen, suffix),
+      };
+      truncatedCount++;
+    }
+    
+    return toolCopy;
+  });
+  
+  if (truncatedCount > 0) {
+    logger.warn(`截断了 ${truncatedCount} 个工具描述以符合 Amazon Q 的 10k 限制`);
+  }
+  
+  return processed;
+};
 
 const parseJson = async (request) => {
   try {
@@ -294,7 +371,6 @@ class AmazonQAuthManager {
         'content-type': 'application/json',
       },
       body: JSON.stringify(payload),
-      // Cloudflare Workers 不支持自定义 CA bundle，verify=false 也不支持。但保留逻辑。
     });
 
     if (!response.ok) {
@@ -348,27 +424,123 @@ class AmazonQAuthManager {
   }
 }
 
-const serializeJson = (value) => JSON.stringify(value, null, 2);
+const normalizeMessages = (messages) => {
+  if (!Array.isArray(messages)) return [];
+  
+  const normalized = [];
+  let lastRole = null;
+  
+  for (const msg of messages) {
+    if (!msg || !msg.role) continue;
+    
+    if (msg.role === lastRole && msg.role !== 'system') {
+      const lastMsg = normalized[normalized.length - 1];
+      if (Array.isArray(lastMsg.content) && Array.isArray(msg.content)) {
+        lastMsg.content = [...lastMsg.content, ...msg.content];
+      } else if (typeof lastMsg.content === 'string' && typeof msg.content === 'string') {
+        lastMsg.content += '\n\n' + msg.content;
+      }
+      continue;
+    }
+    
+    normalized.push({ ...msg });
+    lastRole = msg.role;
+  }
+  
+  const paired = [];
+  for (let i = 0; i < normalized.length; i++) {
+    const msg = normalized[i];
+    
+    if (msg.role === 'system') {
+      paired.push(msg);
+      continue;
+    }
+    
+    if (msg.role === 'user') {
+      paired.push(msg);
+      const next = normalized[i + 1];
+      if (!next || next.role !== 'assistant') {
+        paired.push({
+          role: 'assistant',
+          content: '',
+        });
+      }
+    } else if (msg.role === 'assistant') {
+      if (paired.length === 0 || paired[paired.length - 1].role !== 'user') {
+        paired.push({
+          role: 'user',
+          content: '',
+        });
+      }
+      paired.push(msg);
+    }
+  }
+  
+  return paired;
+};
 
-const messagesToContent = (messages) => {
-  if (!Array.isArray(messages)) return '';
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
+const extractSystemPrompt = (messages) => {
+  const systemMessages = [];
+  const otherMessages = [];
+  
+  for (const msg of messages) {
+    if (msg.role === 'system') {
+      systemMessages.push(msg);
+    } else {
+      otherMessages.push(msg);
+    }
+  }
+  
+  if (systemMessages.length === 0) {
+    return { systemPrompt: null, messages: otherMessages };
+  }
+  
+  const systemTexts = systemMessages.map(m => {
+    if (typeof m.content === 'string') return m.content;
+    if (Array.isArray(m.content)) {
+      return m.content
+        .filter(item => item.type === 'text')
+        .map(item => item.text)
+        .join('\n');
+    }
+    return '';
+  }).filter(Boolean);
+  
+  return {
+    systemPrompt: systemTexts.join('\n\n'),
+    messages: otherMessages,
+  };
+};
+
+const messagesToAmazonQContent = (messages, systemPrompt) => {
+  if (!Array.isArray(messages) || messages.length === 0) return '';
+  
+  const parts = [];
+  
+  if (systemPrompt) {
+    parts.push(`<system>\n${systemPrompt}\n</system>\n`);
+  }
+  
+  for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg && msg.role === 'user') {
       const { content } = msg;
       if (Array.isArray(content)) {
-        const result = [];
+        const texts = [];
         for (const item of content) {
           if (item && typeof item === 'object' && item.type === 'text') {
-            result.push(item.text ?? '');
+            texts.push(item.text ?? '');
           }
         }
-        return result.join(' ');
+        parts.push(texts.join(' '));
+      } else if (typeof content === 'string') {
+        parts.push(content);
       }
-      return content ?? '';
+      break;
     }
   }
-  return '';
+  
+  return parts.join('\n');
 };
 
 const extractJsonFromBuffer = (buffer, startPattern = '{"content":') => {
@@ -446,8 +618,10 @@ const parseEventStream = (rawResponse) => {
   return printableLines.join('\n');
 };
 
-const amazonqToOpenaiResponse = (amazonqRawResponse, model, conversationId) => {
+const amazonqToOpenaiResponse = (amazonqRawResponse, model, conversationId, inputTokens) => {
   const content = parseEventStream(amazonqRawResponse);
+  const outputTokens = estimateTokens(content);
+  
   return {
     id: `chatcmpl-${conversationId.slice(0, 8)}`,
     object: 'chat.completion',
@@ -464,9 +638,9 @@ const amazonqToOpenaiResponse = (amazonqRawResponse, model, conversationId) => {
       },
     ],
     usage: {
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
+      prompt_tokens: inputTokens || 0,
+      completion_tokens: outputTokens,
+      total_tokens: (inputTokens || 0) + outputTokens,
     },
   };
 };
@@ -478,6 +652,8 @@ const createStreamChunk = ({
   formatType,
   messageId,
   finalText,
+  inputTokens,
+  outputTokens,
 }) => {
   if (formatType === 'anthropic') {
     const id = messageId || `msg_${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`;
@@ -485,6 +661,10 @@ const createStreamChunk = ({
     let chunk;
 
     switch (chunkType) {
+      case 'ping':
+        eventName = 'ping';
+        chunk = { type: 'ping' };
+        break;
       case 'start':
         eventName = 'message_start';
         chunk = {
@@ -497,7 +677,7 @@ const createStreamChunk = ({
             model,
             stop_reason: null,
             stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
+            usage: { input_tokens: inputTokens || 0, output_tokens: 0 },
           },
         };
         break;
@@ -526,29 +706,12 @@ const createStreamChunk = ({
         chunk = {
           type: 'message_delta',
           delta: { stop_reason: 'end_turn', stop_sequence: null },
-          usage: { output_tokens: 0 },
+          usage: { output_tokens: outputTokens || 0 },
         };
         break;
       case 'stop':
         eventName = 'message_stop';
-        chunk = {
-          type: 'message_stop',
-          message: {
-            id,
-            type: 'message',
-            role: 'assistant',
-            model,
-            content: [
-              {
-                type: 'text',
-                text: finalText || '',
-              },
-            ],
-            stop_reason: 'end_turn',
-            stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 },
-          },
-        };
+        chunk = { type: 'message_stop' };
         break;
       default:
         eventName = '';
@@ -712,29 +875,28 @@ const fetchAmazonQ = async ({
   return response;
 };
 
-const bufferText = async (resp) => {
-  const text = await resp.text();
-  return text;
-};
-
-const buildAnthropicResponse = ({ model, content }) => ({
-  id: `msg_${crypto.randomUUID().replace(/-/g, '')}`,
-  type: 'message',
-  role: 'assistant',
-  content: [
-    {
-      type: 'text',
-      text: content,
+const buildAnthropicResponse = ({ model, content, inputTokens }) => {
+  const outputTokens = estimateTokens(content);
+  
+  return {
+    id: `msg_${crypto.randomUUID().replace(/-/g, '')}`,
+    type: 'message',
+    role: 'assistant',
+    content: [
+      {
+        type: 'text',
+        text: content,
+      },
+    ],
+    model,
+    stop_reason: 'end_turn',
+    stop_sequence: null,
+    usage: {
+      input_tokens: inputTokens || 0,
+      output_tokens: outputTokens,
     },
-  ],
-  model,
-  stop_reason: 'end_turn',
-  stop_sequence: null,
-  usage: {
-    input_tokens: 0,
-    output_tokens: 0,
-  },
-});
+  };
+};
 
 const respondWithJson = (data, init = {}) => {
   return new Response(JSON.stringify(data), {
@@ -781,7 +943,7 @@ const modelsResponse = () => ({
 
 const indexResponse = () => ({
   message: 'Amazon Q to OpenAI API Bridge',
-  version: '2.0.0',
+  version: '2.1.0',
   auth_method: 'OAuth 2.0',
   endpoints: {
     openai_chat: '/v1/chat/completions',
@@ -791,9 +953,16 @@ const indexResponse = () => ({
     health: '/health',
   },
   default_model: 'claude-sonnet-4.5',
+  features: [
+    'Tool calling with 10k description limit',
+    'Input tokens estimation',
+    'System prompt handling',
+    'Message pairing for Amazon Q',
+    'Ping events for Claude Code',
+  ],
 });
 
-const streamAmazonQ = ({ amazonqResponse, model, formatType, bufferLimit }) => {
+const streamAmazonQ = ({ amazonqResponse, model, formatType, bufferLimit, inputTokens }) => {
   const reader = amazonqResponse.body?.getReader();
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
@@ -811,6 +980,8 @@ const streamAmazonQ = ({ amazonqResponse, model, formatType, bufferLimit }) => {
           formatType,
           messageId,
           finalText: options.finalText,
+          inputTokens: options.inputTokens,
+          outputTokens: options.outputTokens,
         }),
       ),
     );
@@ -831,13 +1002,18 @@ const streamAmazonQ = ({ amazonqResponse, model, formatType, bufferLimit }) => {
 
       try {
         if (formatType === 'anthropic') {
-          sendChunk(controller, 'start');
+          sendChunk(controller, 'ping');
+        }
+        
+        if (formatType === 'anthropic') {
+          sendChunk(controller, 'start', '', { inputTokens });
           sendChunk(controller, 'content_start');
         } else {
           sendChunk(controller, 'start');
         }
 
         let buffer = '';
+        let chunkCount = 0;
 
         const processBuffer = () => {
           while (true) {
@@ -847,11 +1023,12 @@ const streamAmazonQ = ({ amazonqResponse, model, formatType, bufferLimit }) => {
             try {
               const obj = JSON.parse(jsonStr);
               if (typeof obj.content === 'string' && obj.content) {
-                if (formatType === 'anthropic') {
-                  accumulated.push(obj.content);
-                  sendChunk(controller, 'content', obj.content);
-                } else {
-                  sendChunk(controller, 'content', obj.content);
+                accumulated.push(obj.content);
+                sendChunk(controller, 'content', obj.content);
+                chunkCount++;
+                
+                if (formatType === 'anthropic' && chunkCount % 10 === 0) {
+                  sendChunk(controller, 'ping');
                 }
               }
             } catch (err) {
@@ -875,10 +1052,13 @@ const streamAmazonQ = ({ amazonqResponse, model, formatType, bufferLimit }) => {
         buffer += decoder.decode();
         processBuffer();
 
+        const fullText = accumulated.join('');
+        const outputTokens = estimateTokens(fullText);
+
         if (formatType === 'anthropic') {
           sendChunk(controller, 'content_end');
-          sendChunk(controller, 'end');
-          sendChunk(controller, 'stop', '', { finalText: accumulated.join('') });
+          sendChunk(controller, 'end', '', { outputTokens });
+          sendChunk(controller, 'stop');
         } else {
           sendChunk(controller, 'end');
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
@@ -972,11 +1152,22 @@ export default {
           return respondWithJson({ error: 'messages 参数不能为空' }, { status: 400 });
         }
 
+        if (data.tools) {
+          data.tools = processTools(data.tools, config);
+        }
+
+        const normalizedMessages = normalizeMessages(data.messages);
+        const { systemPrompt, messages: messagesWithoutSystem } = extractSystemPrompt(normalizedMessages);
+        
+        const pairedMessages = normalizeMessages(messagesWithoutSystem);
+        
+        const inputTokens = estimateMessagesTokens(pairedMessages) + (systemPrompt ? estimateTokens(systemPrompt) : 0);
+
         const stream = inferStreamPreference({ body: data, formatType, request: { headers: request.headers, query: url.searchParams } });
 
         const model = data.model || 'claude-sonnet-4.5';
         const conversationId = crypto.randomUUID();
-        const message = messagesToContent(data.messages);
+        const message = messagesToAmazonQContent(pairedMessages, systemPrompt);
 
         if (!message) {
           return respondWithJson({ error: '无法从消息中提取用户输入' }, { status: 400 });
@@ -1008,7 +1199,7 @@ export default {
         }
 
         if (stream) {
-          const streamBody = await streamAmazonQ({ amazonqResponse, model, formatType });
+          const streamBody = streamAmazonQ({ amazonqResponse, model, formatType, inputTokens });
           const headers = {
             'cache-control': 'no-cache',
             connection: 'keep-alive',
@@ -1023,11 +1214,11 @@ export default {
         }
 
         const text = await amazonqResponse.text();
-        const openaiResponse = amazonqToOpenaiResponse(text, model, conversationId);
+        const openaiResponse = amazonqToOpenaiResponse(text, model, conversationId, inputTokens);
 
         if (formatType === 'anthropic') {
           const content = openaiResponse.choices[0]?.message?.content || '';
-          const anthropicResp = buildAnthropicResponse({ model, content });
+          const anthropicResp = buildAnthropicResponse({ model, content, inputTokens });
           return respondWithJson(anthropicResp, {
             headers: {
               'anthropic-version': anthropicVersion,
