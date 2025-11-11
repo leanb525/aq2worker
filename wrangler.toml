@@ -2,7 +2,8 @@ name = "amazon-q-api-bridge"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-# Optional: Uncomment and configure if you need KV storage for credentials
-# [[kv_namespaces]]
-# binding = "AMAZONQ_KV"
-# id = "your-kv-namespace-id"
+# KV namespace for storing credentials
+[[kv_namespaces]]
+binding = "AMAZONQ_KV"
+id = "c884164e0d604f539dd0bb093a0f8c2b"
+preview_id = "c884164e0d604f539dd0bb093a0f8c2b"
